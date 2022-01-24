@@ -2,6 +2,24 @@
 
 Small CLI tool to proxy tcp connections from local to resources in k8s network (e.g. databases or resource in other namespaces that you cannot access directly or via `kubectl port-forward`). It will spawn a pod with `socat` to use as relay and connect to that pod via kubernetes' port-forwarding facility.
 
+```
+                   ┌───────────────────────────────┐
+                   │                               │
+                   │  kubernetes cluster network   │
+                   │                               │
+   ┌───────────┐   │  ┌─────────┐     ┌─────────┐  │
+   │           │   │  │         │     │         │  │
+   │           │   │  │ relay   │     │ cluster │  │
+   │ localhost ├───┼─►│         ├────►│         │  │
+   │           │   │  │ pod     │     │ service │  │
+   │           │   │  │         │     │         │  │
+   └─────┬─────┘   │  └─────────┘     └─────────┘  │
+                   │                        ▲      │
+         │         └────────────────────────┼──────┘
+                                             
+         └ ── ── ── ── ── ── ── ── ── ── ── ┘
+```
+
 ## Build
 
 Tested with Go v1.17 on Linux and MacOS.
