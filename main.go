@@ -15,6 +15,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/transport/spdy"
@@ -23,93 +24,10 @@ import (
 const POD_NAME = "kube-relay"
 const POD_IMAGE = "alpine/socat:1.7.4.2-r0"
 
-func run(localPort uint, clusterHost string, clusterPort uint) {
-	kubeconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		clientcmd.NewDefaultClientConfigLoadingRules(),
-		&clientcmd.ConfigOverrides{},
-	)
-
-	namespace, _, err := kubeconfig.Namespace()
-	if err != nil {
-		panic(err)
-	}
-
-	// use the current context in kubeconfig
-	config, err := kubeconfig.ClientConfig()
-	if err != nil {
-		panic(err.Error())
-	}
-
-	// create the clientset
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		panic(err.Error())
-	}
-
-	podsClient := clientset.CoreV1().Pods(namespace)
-
-	manifest := &apiv1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: POD_NAME,
-		},
-		Spec: apiv1.PodSpec{
-			Containers: []apiv1.Container{
-				{
-					Name:  "socat",
-					Image: POD_IMAGE,
-					Args: []string{
-						"TCP-LISTEN:9000,fork",
-						fmt.Sprintf("TCP:%s:%d", clusterHost, clusterPort),
-					},
-				},
-			},
-		},
-	}
-
-	cleanup := func() {
-		fmt.Printf("Delete pod %q\n", POD_NAME)
-		podsClient.Delete(context.TODO(), POD_NAME, metav1.DeleteOptions{})
-	}
-
-	result, err := podsClient.Create(context.TODO(), manifest, metav1.CreateOptions{})
-	if err != nil {
-		panic(err)
-	}
-	defer cleanup()
-	fmt.Printf("Created pod %q\n", result.GetObjectMeta().GetName())
-
-	selector := fmt.Sprintf("metadata.name=%s", POD_NAME)
-	podWatch, err := podsClient.Watch(context.TODO(), metav1.ListOptions{FieldSelector: selector})
-	if err != nil {
-		panic(err)
-	}
-
-	podReady := make(chan int, 1)
-
-	go func() {
-		for event := range podWatch.ResultChan() {
-			p, ok := event.Object.(*v1.Pod)
-			if !ok {
-				panic("unexpected type")
-			}
-			if p.Status.Phase == "Running" {
-				fmt.Printf("Pod %q is running\n", p.Name)
-				podReady <- 1
-			}
-		}
-	}()
-
-	ctrlc := make(chan os.Signal, 1)
-	signal.Notify(ctrlc, os.Interrupt)
-	go func() {
-		<-ctrlc
-		cleanup()
-		os.Exit(1)
-	}()
-
+func forward(namespace string, config *rest.Config, localPort uint) error {
 	roundTripper, upgrader, err := spdy.RoundTripperFor(config)
 	if err != nil {
-		panic(err.Error())
+		return err
 	}
 
 	path := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s/portforward", namespace, POD_NAME)
@@ -137,11 +55,99 @@ func run(localPort uint, clusterHost string, clusterPort uint) {
 		}
 	}()
 
-	<-podReady
-	err = forwarder.ForwardPorts()
+	return forwarder.ForwardPorts()
+}
+
+func spawn(client kubernetes.Interface, namespace string, host string, port uint) (string, error) {
+	manifest := &apiv1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: POD_NAME,
+		},
+		Spec: apiv1.PodSpec{
+			Containers: []apiv1.Container{
+				{
+					Name:  "socat",
+					Image: POD_IMAGE,
+					Args: []string{
+						"TCP-LISTEN:9000,fork",
+						fmt.Sprintf("TCP:%s:%d", host, port),
+					},
+				},
+			},
+		},
+	}
+	result, err := client.CoreV1().Pods(namespace).Create(context.TODO(), manifest, metav1.CreateOptions{})
+	if err != nil {
+		return "", err
+	}
+	name := result.GetObjectMeta().GetName()
+	fmt.Printf("Created pod %q\n", name)
+	return name, nil
+}
+
+func cleanup(client kubernetes.Interface, namespace string) {
+	fmt.Printf("Delete pod %q\n", POD_NAME)
+	client.CoreV1().Pods(namespace).Delete(context.TODO(), POD_NAME, metav1.DeleteOptions{})
+}
+
+func wait(client kubernetes.Interface, namespace string, name string) {
+	selector := fmt.Sprintf("metadata.name=%s", name)
+	podWatch, err := client.CoreV1().Pods(namespace).Watch(context.TODO(), metav1.ListOptions{FieldSelector: selector})
 	if err != nil {
 		panic(err)
 	}
+
+	for event := range podWatch.ResultChan() {
+		p, ok := event.Object.(*v1.Pod)
+		if !ok {
+			panic("unexpected type")
+		}
+		if p.Status.Phase == "Running" {
+			fmt.Printf("Pod %q is running\n", p.Name)
+			break
+		}
+
+	}
+}
+
+func run(localPort uint, clusterHost string, clusterPort uint) {
+	kubeconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		clientcmd.NewDefaultClientConfigLoadingRules(),
+		&clientcmd.ConfigOverrides{},
+	)
+
+	namespace, _, err := kubeconfig.Namespace()
+	if err != nil {
+		panic(err)
+	}
+
+	// use the current context in kubeconfig
+	config, err := kubeconfig.ClientConfig()
+	if err != nil {
+		panic(err.Error())
+	}
+
+	// create the clientset
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	name, err := spawn(clientset, namespace, clusterHost, clusterPort)
+	defer cleanup(clientset, namespace)
+	wait(clientset, namespace, name)
+	err = forward(namespace, config, localPort)
+	if err != nil {
+		panic(err)
+	}
+
+	ctrlc := make(chan os.Signal, 1)
+	signal.Notify(ctrlc, os.Interrupt)
+	go func() {
+		<-ctrlc
+		cleanup(clientset, namespace)
+		os.Exit(1)
+	}()
 }
 
 func main() {
