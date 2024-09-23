@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/urfave/cli/v2"
 	apiv1 "k8s.io/api/core/v1"
@@ -22,7 +23,7 @@ import (
 )
 
 const POD_NAME = "kube-relay"
-const POD_IMAGE = "alpine/socat:1.7.4.2-r0"
+const POD_IMAGE = "alpine/socat:1.8.0.0"
 
 func forward(namespace string, config *rest.Config, localPort uint) error {
 	roundTripper, upgrader, err := spdy.RoundTripperFor(config)
@@ -90,17 +91,17 @@ func cleanup(client kubernetes.Interface, namespace string) {
 	client.CoreV1().Pods(namespace).Delete(context.TODO(), POD_NAME, metav1.DeleteOptions{})
 }
 
-func wait(client kubernetes.Interface, namespace string, name string) {
+func wait(client kubernetes.Interface, namespace string, name string) error {
 	selector := fmt.Sprintf("metadata.name=%s", name)
 	podWatch, err := client.CoreV1().Pods(namespace).Watch(context.TODO(), metav1.ListOptions{FieldSelector: selector})
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	for event := range podWatch.ResultChan() {
 		p, ok := event.Object.(*v1.Pod)
 		if !ok {
-			panic("unexpected type")
+			return fmt.Errorf("unexpected type")
 		}
 		if p.Status.Phase == "Running" {
 			fmt.Printf("Pod %q is running\n", p.Name)
@@ -108,9 +109,10 @@ func wait(client kubernetes.Interface, namespace string, name string) {
 		}
 
 	}
+	return nil
 }
 
-func run(localPort uint, clusterHost string, clusterPort uint) {
+func run(localPort uint, clusterHost string, clusterPort uint) error {
 	kubeconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		clientcmd.NewDefaultClientConfigLoadingRules(),
 		&clientcmd.ConfigOverrides{},
@@ -118,42 +120,51 @@ func run(localPort uint, clusterHost string, clusterPort uint) {
 
 	namespace, _, err := kubeconfig.Namespace()
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	// use the current context in kubeconfig
 	config, err := kubeconfig.ClientConfig()
 	if err != nil {
-		panic(err.Error())
+		return err
 	}
 
 	// create the clientset
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		panic(err.Error())
-	}
-
-	name, err := spawn(clientset, namespace, clusterHost, clusterPort)
-	defer cleanup(clientset, namespace)
-	wait(clientset, namespace, name)
-	err = forward(namespace, config, localPort)
-	if err != nil {
-		panic(err)
+		return err
 	}
 
 	ctrlc := make(chan os.Signal, 1)
-	signal.Notify(ctrlc, os.Interrupt)
+	signal.Notify(ctrlc, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-ctrlc
+		println("received sigterm, triggering cleanup...")
 		cleanup(clientset, namespace)
 		os.Exit(1)
 	}()
+
+	name, err := spawn(clientset, namespace, clusterHost, clusterPort)
+	defer cleanup(clientset, namespace)
+	if err != nil {
+		return err
+	}
+	err = wait(clientset, namespace, name)
+	if err != nil {
+		return err
+	}
+	err = forward(namespace, config, localPort)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func main() {
 	var localPort uint
 	var clusterPort uint
 	var clusterHost string
+	var podImage string
 
 	app := &cli.App{
 		Flags: []cli.Flag{
@@ -161,13 +172,13 @@ func main() {
 				Name:        "local-port",
 				Aliases:     []string{"l"},
 				Value:       1999,
-				Usage:       "the local tcp port",
+				Usage:       "local tcp port",
 				Destination: &localPort,
 			},
 			&cli.StringFlag{
 				Name:        "cluster-host",
 				Aliases:     []string{"ch"},
-				Usage:       "the cluster host",
+				Usage:       "cluster host",
 				Destination: &clusterHost,
 				Required:    true,
 			},
@@ -175,15 +186,22 @@ func main() {
 				Name:        "cluster-port",
 				Aliases:     []string{"cp"},
 				Value:       80,
-				Usage:       "the cluster tcp port",
+				Usage:       "cluster tcp port",
 				Destination: &clusterPort,
+			},
+			&cli.StringFlag{
+				Name:        "pod-image",
+				Aliases:     []string{"p"},
+				Value:       POD_IMAGE,
+				Usage:       "socat oci image",
+				Destination: &podImage,
 			},
 		},
 		Name:  "kube-relay",
 		Usage: "access tcp ports in a kubernetes cluster via a pod relay (locally)",
 		Action: func(c *cli.Context) error {
-			run(localPort, clusterHost, clusterPort)
-			return nil
+			err := run(localPort, clusterHost, clusterPort)
+			return err
 		},
 	}
 
