@@ -59,7 +59,7 @@ func forward(namespace string, config *rest.Config, localPort uint) error {
 	return forwarder.ForwardPorts()
 }
 
-func spawn(client kubernetes.Interface, namespace string, host string, port uint) (string, error) {
+func spawn(client kubernetes.Interface, namespace string, host string, port uint, image string) (string, error) {
 	manifest := &apiv1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: POD_NAME,
@@ -68,7 +68,7 @@ func spawn(client kubernetes.Interface, namespace string, host string, port uint
 			Containers: []apiv1.Container{
 				{
 					Name:  "socat",
-					Image: POD_IMAGE,
+					Image: image,
 					Args: []string{
 						"TCP-LISTEN:9000,fork",
 						fmt.Sprintf("TCP:%s:%d", host, port),
@@ -112,7 +112,7 @@ func wait(client kubernetes.Interface, namespace string, name string) error {
 	return nil
 }
 
-func run(localPort uint, clusterHost string, clusterPort uint) error {
+func run(localPort uint, clusterHost string, clusterPort uint, podImage string) error {
 	kubeconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		clientcmd.NewDefaultClientConfigLoadingRules(),
 		&clientcmd.ConfigOverrides{},
@@ -144,7 +144,7 @@ func run(localPort uint, clusterHost string, clusterPort uint) error {
 		os.Exit(1)
 	}()
 
-	name, err := spawn(clientset, namespace, clusterHost, clusterPort)
+	name, err := spawn(clientset, namespace, clusterHost, clusterPort, podImage)
 	defer cleanup(clientset, namespace)
 	if err != nil {
 		return err
@@ -200,7 +200,7 @@ func main() {
 		Name:  "kube-relay",
 		Usage: "access tcp ports in a kubernetes cluster via a pod relay (locally)",
 		Action: func(c *cli.Context) error {
-			err := run(localPort, clusterHost, clusterPort)
+			err := run(localPort, clusterHost, clusterPort, podImage)
 			return err
 		},
 	}
