@@ -14,6 +14,7 @@ import (
 	"github.com/urfave/cli/v2"
 	apiv1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -59,22 +60,45 @@ func forward(namespace string, config *rest.Config, localPort uint) error {
 	return forwarder.ForwardPorts()
 }
 
-func spawn(client kubernetes.Interface, namespace string, host string, port uint, image string) (string, error) {
+func spawn(client kubernetes.Interface, namespace string, host string, port uint, image string, cpuRequest, cpuLimit, memRequest, memLimit string) (string, error) {
+	container := apiv1.Container{
+		Name:  "socat",
+		Image: image,
+		Args: []string{
+			"TCP-LISTEN:9000,fork",
+			fmt.Sprintf("TCP:%s:%d", host, port),
+		},
+	}
+
+	// Add resource requirements if specified
+	if cpuRequest != "" || cpuLimit != "" || memRequest != "" || memLimit != "" {
+		resources := apiv1.ResourceRequirements{
+			Requests: apiv1.ResourceList{},
+			Limits:   apiv1.ResourceList{},
+		}
+
+		if cpuRequest != "" {
+			resources.Requests[apiv1.ResourceCPU] = resource.MustParse(cpuRequest)
+		}
+		if memRequest != "" {
+			resources.Requests[apiv1.ResourceMemory] = resource.MustParse(memRequest)
+		}
+		if cpuLimit != "" {
+			resources.Limits[apiv1.ResourceCPU] = resource.MustParse(cpuLimit)
+		}
+		if memLimit != "" {
+			resources.Limits[apiv1.ResourceMemory] = resource.MustParse(memLimit)
+		}
+
+		container.Resources = resources
+	}
+
 	manifest := &apiv1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: POD_NAME,
 		},
 		Spec: apiv1.PodSpec{
-			Containers: []apiv1.Container{
-				{
-					Name:  "socat",
-					Image: image,
-					Args: []string{
-						"TCP-LISTEN:9000,fork",
-						fmt.Sprintf("TCP:%s:%d", host, port),
-					},
-				},
-			},
+			Containers: []apiv1.Container{container},
 		},
 	}
 	result, err := client.CoreV1().Pods(namespace).Create(context.TODO(), manifest, metav1.CreateOptions{})
@@ -112,7 +136,7 @@ func wait(client kubernetes.Interface, namespace string, name string) error {
 	return nil
 }
 
-func run(localPort uint, clusterHost string, clusterPort uint, podImage string) error {
+func run(localPort uint, clusterHost string, clusterPort uint, podImage string, cpuRequest, cpuLimit, memRequest, memLimit string) error {
 	kubeconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		clientcmd.NewDefaultClientConfigLoadingRules(),
 		&clientcmd.ConfigOverrides{},
@@ -144,7 +168,7 @@ func run(localPort uint, clusterHost string, clusterPort uint, podImage string) 
 		os.Exit(1)
 	}()
 
-	name, err := spawn(clientset, namespace, clusterHost, clusterPort, podImage)
+	name, err := spawn(clientset, namespace, clusterHost, clusterPort, podImage, cpuRequest, cpuLimit, memRequest, memLimit)
 	defer cleanup(clientset, namespace)
 	if err != nil {
 		return err
@@ -165,6 +189,10 @@ func main() {
 	var clusterPort uint
 	var clusterHost string
 	var podImage string
+	var cpuRequest string
+	var cpuLimit string
+	var memRequest string
+	var memLimit string
 
 	app := &cli.App{
 		Flags: []cli.Flag{
@@ -196,11 +224,37 @@ func main() {
 				Usage:       "socat oci image",
 				Destination: &podImage,
 			},
+			&cli.StringFlag{
+				Name:        "cpu-request",
+				Value:       "100m",
+				Usage:       "CPU request for the socat container (e.g., 100m, 0.5)",
+				Destination: &cpuRequest,
+			},
+			&cli.StringFlag{
+				Name:        "cpu-limit",
+				Value:       "100m",
+				Usage:       "CPU limit for the socat container (e.g., 200m, 1)",
+				Destination: &cpuLimit,
+			},
+			&cli.StringFlag{
+				Name:        "memory-request",
+				Aliases:     []string{"mem-request"},
+				Value:       "100Mi",
+				Usage:       "Memory request for the socat container (e.g., 64Mi, 128Mi)",
+				Destination: &memRequest,
+			},
+			&cli.StringFlag{
+				Name:        "memory-limit",
+				Aliases:     []string{"mem-limit"},
+				Value:       "100Mi",
+				Usage:       "Memory limit for the socat container (e.g., 128Mi, 256Mi)",
+				Destination: &memLimit,
+			},
 		},
 		Name:  "kube-relay",
 		Usage: "access tcp ports in a kubernetes cluster via a pod relay (locally)",
 		Action: func(c *cli.Context) error {
-			err := run(localPort, clusterHost, clusterPort, podImage)
+			err := run(localPort, clusterHost, clusterPort, podImage, cpuRequest, cpuLimit, memRequest, memLimit)
 			return err
 		},
 	}
