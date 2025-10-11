@@ -30,9 +30,19 @@ go build
 ```
 
 ## Run
-
+Connect to a service
 ```bash
 ./kube-relay -ch some-service.my-namespace
+Created pod "kube-relay"
+Pod "kube-relay" is running
+Forwarding from 127.0.0.1:1999 -> 9000
+Forwarding from [::1]:1999 -> 9000
+```
+
+Connect to a pod using its podIp
+```bash
+export POD_IP=$(kubectl get pod <pod> -o yaml  | yq '.status.podIP')
+./kube-relay -ch "${POD_IP}"
 Created pod "kube-relay"
 Pod "kube-relay" is running
 Forwarding from 127.0.0.1:1999 -> 9000
